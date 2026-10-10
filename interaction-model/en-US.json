@@ -1,0 +1,38 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "daily quiz",
+      "intents": [
+        {"name":"AMAZON.HelpIntent","samples":[]},
+        {"name":"AMAZON.CancelIntent","samples":[]},
+        {"name":"AMAZON.StopIntent","samples":[]},
+        {"name":"AMAZON.RepeatIntent","samples":[]},
+        {
+          "name":"GiveUpIntent",
+          "samples":[
+            "I don't know",
+            "I do not know",
+            "pass",
+            "skip",
+            "give up",
+            "no idea"
+          ]
+        },
+        {
+          "name":"AnswerIntent",
+          "slots":[{"name":"answer","type":"AMAZON.SearchQuery"}],
+          "samples":[
+            "what is {answer}",
+            "who is {answer}",
+            "where is {answer}",
+            "what are {answer}",
+            "who are {answer}",
+            "my answer is {answer}",
+            "my response is {answer}",
+            "{answer}"
+          ]
+        }
+      ]
+    }
+  }
+}

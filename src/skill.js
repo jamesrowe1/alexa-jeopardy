@@ -1,0 +1,519 @@
+const Alexa = require('ask-sdk-core');
+const { createClient } = require('@supabase/supabase-js');
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
+
+function escapeSsml(text = '') {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+async function latestEpisode() {
+  const { data, error } = await supabase
+    .from('episodes')
+    .select('*')
+    .order('air_date', { ascending: false })
+    .limit(1)
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function cluesForEpisode(episodeId) {
+  const { data, error } = await supabase
+    .from('clues')
+    .select('*')
+    .eq('episode_id', episodeId)
+    .order('round')
+    .order('category')
+    .order('board_position');
+
+  if (error) throw error;
+  return data;
+}
+
+function randomItem(items) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function chooseOnePerCategory(clues, round) {
+  const roundClues = clues.filter(c => c.round === round);
+  const byCategory = new Map();
+
+  for (const clue of roundClues) {
+    if (!byCategory.has(clue.category)) {
+      byCategory.set(clue.category, []);
+    }
+    byCategory.get(clue.category).push(clue);
+  }
+
+  return [...byCategory.values()].map(randomItem);
+}
+
+function buildGame(clues) {
+  const jeopardy = chooseOnePerCategory(clues, 'J');
+  const doubleJeopardy = chooseOnePerCategory(clues, 'DJ');
+  const finalJeopardy = clues.find(c => c.round === 'FJ');
+
+  if (
+    jeopardy.length !== 6 ||
+    doubleJeopardy.length !== 6 ||
+    !finalJeopardy
+  ) {
+    throw new Error(
+      `Episode is incomplete: J=${jeopardy.length}, DJ=${doubleJeopardy.length}, FJ=${finalJeopardy ? 1 : 0}`
+    );
+  }
+
+  return [...jeopardy, ...doubleJeopardy, finalJeopardy].map(
+    (clue, index) => ({
+      ...clue,
+      gameNumber: index + 1,
+      gameValue: clue.round === 'FJ' ? 2000 : Number(clue.value || 0)
+    })
+  );
+}
+
+function formatDate(dateString) {
+  const [year, month, day] = dateString.split('-').map(Number);
+
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC'
+  }).format(new Date(Date.UTC(year, month - 1, day)));
+}
+
+function formatMoney(value) {
+  const n = Number(value || 0);
+
+  return n < 0
+    ? `negative $${Math.abs(n).toLocaleString()}`
+    : `$${n.toLocaleString()}`;
+}
+
+function clueSpeech(clue) {
+  const category = escapeSsml(clue.category);
+  const clueText = escapeSsml(clue.clue);
+
+  if (clue.round === 'FJ') {
+    return (
+      `Final Jeopardy. ` +
+      `The category is ${category}. ` +
+      `Here is your final clue. ${clueText}`
+    );
+  }
+
+  const roundName =
+    clue.round === 'DJ' ? 'Double Jeopardy' : 'Jeopardy';
+
+  const dailyDoubleText = clue.is_daily_double
+    ? ' This was a Daily Double on the show.'
+    : '';
+
+  return (
+    `${roundName}. ` +
+    `Category: ${category}. ` +
+    `For ${formatMoney(clue.gameValue)}.` +
+    `${dailyDoubleText} ${clueText}`
+  );
+}
+
+function setCurrentClue(attrs) {
+  const clue = attrs.game[attrs.gameIndex];
+
+  attrs.currentClueId = clue.id;
+  attrs.currentResponse = clue.response;
+  attrs.currentValue = clue.gameValue;
+  attrs.currentCategory = clue.category;
+  attrs.currentRound = clue.round;
+
+  return clue;
+}
+
+function fuzzy(a, b) {
+  const norm = s =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/\([^)]*\)/g, ' ')
+      .replace(
+        /\b(what|who|where|when|is|are|was|were|the|a|an)\b/g,
+        ' '
+      )
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+
+  const A = norm(a);
+  const B = norm(b);
+
+  if (!A || !B) return false;
+
+  return A === B || A.includes(B) || B.includes(A);
+}
+
+function advanceAfterAnswer(attrs, wasCorrect, expected) {
+  const scoreText = `Your score is ${formatMoney(attrs.score)}.`;
+
+  const resultText = wasCorrect
+    ? `Correct! ${scoreText}`
+    : `Sorry, the correct response was ${escapeSsml(expected)}. ${scoreText}`;
+
+  attrs.gameIndex += 1;
+  attrs.currentClueId = null;
+  attrs.currentResponse = null;
+
+  if (attrs.gameIndex >= attrs.game.length) {
+    return {
+      done: true,
+      speech:
+        `${resultText} ` +
+        `That's the end of today's game. ` +
+        `Your final score is ${formatMoney(attrs.score)}. ` +
+        `Thanks for playing Daily Quiz.`
+    };
+  }
+
+  const next = setCurrentClue(attrs);
+
+  let transition = '';
+
+  if (next.gameNumber === 7) {
+    transition = ' Now we move to Double Jeopardy.';
+  }
+
+  if (next.gameNumber === 13) {
+    transition = ' And now, Final Jeopardy.';
+  }
+
+  return {
+    done: false,
+    speech: `${resultText}${transition} ${clueSpeech(next)}`
+  };
+}
+
+const LaunchRequestHandler = {
+  canHandle(h) {
+    return Alexa.getRequestType(h.requestEnvelope) === 'LaunchRequest';
+  },
+
+  async handle(h) {
+    const episode = await latestEpisode();
+    const clues = await cluesForEpisode(episode.id);
+    const game = buildGame(clues);
+
+    const attrs = {
+      episodeId: episode.id,
+      airDate: episode.air_date,
+      score: 0,
+      game,
+      gameIndex: 0
+    };
+
+    const first = setCurrentClue(attrs);
+
+    h.attributesManager.setSessionAttributes(attrs);
+
+    return h.responseBuilder
+      .speak(
+        `Welcome to Daily Quiz. ` +
+        `I'm using the game from ${formatDate(episode.air_date)}. ` +
+        `You'll get one randomly selected clue from each of the twelve categories, followed by Final Jeopardy. ` +
+        `There are thirteen clues total. Let's begin. ` +
+        `${clueSpeech(first)}`
+      )
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const AnswerIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'AnswerIntent'
+    );
+  },
+
+  handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+
+    if (!attrs.currentClueId || !attrs.game) {
+      return h.responseBuilder
+        .speak(
+          'There is no active clue. Please reopen Daily Quiz to begin a new game.'
+        )
+        .getResponse();
+    }
+
+    const answer =
+      Alexa.getSlotValue(h.requestEnvelope, 'answer') || '';
+
+    const expected = attrs.currentResponse || '';
+    const correct = fuzzy(answer, expected);
+    const value = Number(attrs.currentValue || 0);
+
+    attrs.score =
+      Number(attrs.score || 0) + (correct ? value : -value);
+
+    const result = advanceAfterAnswer(
+      attrs,
+      correct,
+      expected
+    );
+
+    h.attributesManager.setSessionAttributes(attrs);
+
+    if (result.done) {
+      return h.responseBuilder
+        .speak(result.speech)
+        .getResponse();
+    }
+
+    return h.responseBuilder
+      .speak(result.speech)
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const GiveUpIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'GiveUpIntent'
+    );
+  },
+
+  handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+
+    if (!attrs.currentClueId || !attrs.game) {
+      return h.responseBuilder
+        .speak(
+          'There is no active clue. Please reopen Daily Quiz to begin a new game.'
+        )
+        .getResponse();
+    }
+
+    const expected = attrs.currentResponse || '';
+
+    const resultText =
+      `The correct response was ${escapeSsml(expected)}. ` +
+      `Your score is ${formatMoney(attrs.score)}.`;
+
+    attrs.gameIndex += 1;
+    attrs.currentClueId = null;
+    attrs.currentResponse = null;
+
+    if (attrs.gameIndex >= attrs.game.length) {
+      h.attributesManager.setSessionAttributes(attrs);
+
+      return h.responseBuilder
+        .speak(
+          `${resultText} ` +
+          `That's the end of today's game. ` +
+          `Your final score is ${formatMoney(attrs.score)}. ` +
+          `Thanks for playing Daily Quiz.`
+        )
+        .getResponse();
+    }
+
+    const next = setCurrentClue(attrs);
+
+    let transition = '';
+
+    if (next.gameNumber === 7) {
+      transition = ' Now we move to Double Jeopardy.';
+    }
+
+    if (next.gameNumber === 13) {
+      transition = ' And now, Final Jeopardy.';
+    }
+
+    h.attributesManager.setSessionAttributes(attrs);
+
+    return h.responseBuilder
+      .speak(`${resultText}${transition} ${clueSpeech(next)}`)
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const RepeatIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) ===
+        'AMAZON.RepeatIntent'
+    );
+  },
+
+  handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+
+    if (!attrs.game || !attrs.currentClueId) {
+      return h.responseBuilder
+        .speak('There is no active clue to repeat.')
+        .getResponse();
+    }
+
+    const clue = attrs.game[attrs.gameIndex];
+
+    return h.responseBuilder
+      .speak(clueSpeech(clue))
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const HelpIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) ===
+        'AMAZON.HelpIntent'
+    );
+  },
+
+  handle(h) {
+    return h.responseBuilder
+      .speak(
+        `Answer each clue naturally, for example, what is Jupiter. ` +
+        `Say repeat to hear the clue again, or say I don't know to pass.`
+      )
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const FallbackIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) ===
+        'AMAZON.FallbackIntent'
+    );
+  },
+
+  handle(h) {
+    return h.responseBuilder
+      .speak(
+        `I didn't catch that response. ` +
+        `Please answer the clue with something like, what is Jupiter, ` +
+        `or say I don't know.`
+      )
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const CancelAndStopIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      ['AMAZON.CancelIntent', 'AMAZON.StopIntent'].includes(
+        Alexa.getIntentName(h.requestEnvelope)
+      )
+    );
+  },
+
+  handle(h) {
+    const score =
+      h.attributesManager.getSessionAttributes().score || 0;
+
+    return h.responseBuilder
+      .speak(
+        `Thanks for playing. Your score is ${formatMoney(score)}.`
+      )
+      .getResponse();
+  }
+};
+
+const SessionEndedRequestHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) ===
+      'SessionEndedRequest'
+    );
+  },
+
+  handle(h) {
+    console.log(
+      'Session ended:',
+      JSON.stringify(
+        h.requestEnvelope.request,
+        null,
+        2
+      )
+    );
+
+    return h.responseBuilder.getResponse();
+  }
+};
+
+const ErrorHandler = {
+  canHandle() {
+    return true;
+  },
+
+  handle(h, error) {
+    console.error('Alexa skill error:', error);
+
+    return h.responseBuilder
+      .speak('Something went wrong. Please try again.')
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const SkillIdValidationInterceptor = {
+  process(handlerInput) {
+    const expectedSkillId =
+      process.env.ALEXA_SKILL_ID;
+
+    if (!expectedSkillId) {
+      return;
+    }
+
+    const envelope = handlerInput.requestEnvelope;
+
+    const actualSkillId =
+      envelope?.context?.System?.application?.applicationId ||
+      envelope?.session?.application?.applicationId;
+
+    if (actualSkillId !== expectedSkillId) {
+      throw new Error(
+        'Request was sent to the wrong Alexa skill.'
+      );
+    }
+  }
+};
+
+const skill = Alexa.SkillBuilders.custom()
+  .addRequestInterceptors(
+    SkillIdValidationInterceptor
+  )
+  .addRequestHandlers(
+    LaunchRequestHandler,
+    AnswerIntentHandler,
+    GiveUpIntentHandler,
+    RepeatIntentHandler,
+    HelpIntentHandler,
+    FallbackIntentHandler,
+    CancelAndStopIntentHandler,
+    SessionEndedRequestHandler
+  )
+  .addErrorHandlers(ErrorHandler)
+  .create();
+
+module.exports = skill;
