@@ -263,7 +263,7 @@ const AnswerIntentHandler = {
     const value = Number(attrs.currentValue || 0);
 
     attrs.score =
-      Number(attrs.score || 0) + (correct ? value : -value);
+        Number(attrs.score || 0) + (correct ? value : 0);
 
     const result = advanceAfterAnswer(
       attrs,
