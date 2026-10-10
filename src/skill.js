@@ -16,6 +16,116 @@ function escapeSsml(text = '') {
     .replace(/'/g, '&apos;');
 }
 
+function supportsAPL(handlerInput) {
+  return !!handlerInput.requestEnvelope
+    ?.context
+    ?.System
+    ?.device
+    ?.supportedInterfaces
+    ?.[ 'Alexa.Presentation.APL' ];
+}
+
+function escapeAplText(text = '') {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function addClueVisual(handlerInput, clue, attrs) {
+  if (!supportsAPL(handlerInput)) {
+    return;
+  }
+
+  let roundLabel;
+
+  if (clue.round === 'DJ') {
+    roundLabel = 'DOUBLE JEOPARDY';
+  } else if (clue.round === 'FJ') {
+    roundLabel = 'FINAL JEOPARDY';
+  } else {
+    roundLabel = 'JEOPARDY';
+  }
+
+  const clueNumber =
+    Number(attrs.gameIndex || 0) + 1;
+
+  const totalClues =
+    attrs.game?.length || 13;
+
+  const valueText =
+    clue.round === 'FJ'
+      ? `Clue ${clueNumber} of ${totalClues}`
+      : `$${Number(clue.gameValue || clue.value || 0).toLocaleString()} • Clue ${clueNumber} of ${totalClues}`;
+
+  handlerInput.responseBuilder.addDirective({
+    type: 'Alexa.Presentation.APL.RenderDocument',
+    token: `daily-quiz-clue-${clueNumber}`,
+
+    document: {
+      type: 'APL',
+      version: '2024.3',
+      theme: 'dark',
+
+      mainTemplate: {
+        items: [
+          {
+            type: 'Container',
+            width: '100vw',
+            height: '100vh',
+
+            paddingLeft: '6vw',
+            paddingRight: '6vw',
+            paddingTop: '5vh',
+            paddingBottom: '5vh',
+
+            items: [
+              {
+                type: 'Text',
+                text: escapeAplText(roundLabel),
+                fontSize: '28dp',
+                fontWeight: 'bold',
+                textAlign: 'center',
+                color: '#FFD700',
+                maxLines: 1
+              },
+
+              {
+                type: 'Text',
+                text: escapeAplText(clue.category),
+                fontSize: '42dp',
+                fontWeight: 'bold',
+                textAlign: 'center',
+                spacing: '2vh',
+                maxLines: 2
+              },
+
+              {
+                type: 'Text',
+                text: escapeAplText(valueText),
+                fontSize: '26dp',
+                textAlign: 'center',
+                spacing: '1vh',
+                maxLines: 1
+              },
+
+              {
+                type: 'Text',
+                text: escapeAplText(clue.clue),
+                fontSize: '36dp',
+                textAlign: 'center',
+                textAlignVertical: 'center',
+                spacing: '5vh',
+                maxLines: 8
+              }
+            ]
+          }
+        ]
+      }
+    }
+  });
+}
+
 async function latestEpisode() {
   const { data, error } = await supabase
     .from('episodes')
@@ -343,7 +453,12 @@ function fuzzy(userAnswer, expectedAnswer) {
   return false;
 }
 
-function advanceAfterAnswer(attrs, wasCorrect, expected) {
+function advanceAfterAnswer(
+  handlerInput,
+  attrs,
+  wasCorrect,
+  expected
+) {
   const scoreText = `Your score is ${formatMoney(attrs.score)}.`;
 
   const resultText = wasCorrect
@@ -366,6 +481,12 @@ function advanceAfterAnswer(attrs, wasCorrect, expected) {
   }
 
   const next = setCurrentClue(attrs);
+
+  addClueVisual(
+  handlerInput,
+  next,
+  attrs
+);
 
   let transition = '';
 
@@ -458,6 +579,8 @@ const DifficultyIntentHandler = {
 
     h.attributesManager.setSessionAttributes(attrs);
 
+    addClueVisual(h, first, attrs);
+
     return h.responseBuilder
       .speak(
         `Difficulty ${difficulty}. ` +
@@ -504,6 +627,7 @@ const AnswerIntentHandler = {
         Number(attrs.score || 0) + (correct ? value : 0);
 
     const result = advanceAfterAnswer(
+      h,
       attrs,
       correct,
       expected
@@ -568,6 +692,12 @@ const GiveUpIntentHandler = {
 
     const next = setCurrentClue(attrs);
 
+    addClueVisual(
+      h,
+      next,
+      attrs
+    );
+
     let transition = '';
 
     if (next.gameNumber === 7) {
@@ -611,6 +741,12 @@ const RepeatClueIntentHandler = {
     }
 
     const clue = attrs.game[attrs.gameIndex];
+    
+    addClueVisual(
+      h,
+      clue,
+      attrs
+    );
 
     return h.responseBuilder
       .speak(clueSpeech(clue))
@@ -735,23 +871,23 @@ const RestartGameIntentHandler = {
   async handle(h) {
     const attrs = h.attributesManager.getSessionAttributes();
 
-    if (!attrs.selectedEpisodeId || !attrs.difficulty) {
+    if (!attrs.episodeId || !attrs.difficulty) {
       h.attributesManager.setSessionAttributes({
-        awaitingGameChoice: true
+        awaitingDifficulty: true
       });
 
       return h.responseBuilder
         .speak(
-          `Let's start over. Would you like the latest game or a historical game?`
+          `Let's start over. Choose a difficulty from 1 to 5.`
         )
         .reprompt(
-          'Say latest game or historical game.'
+          'What difficulty would you like?'
         )
         .getResponse();
     }
 
     const clues = await cluesForEpisode(
-      attrs.selectedEpisodeId
+      attrs.episodeId
     );
 
     const game = buildGame(
@@ -766,6 +902,12 @@ const RestartGameIntentHandler = {
     const first = setCurrentClue(attrs);
 
     h.attributesManager.setSessionAttributes(attrs);
+
+    addClueVisual(
+      h,
+      first,
+      attrs
+    );
 
     return h.responseBuilder
       .speak(
@@ -906,9 +1048,6 @@ const skill = Alexa.SkillBuilders.custom()
   )
   .addRequestHandlers(
     LaunchRequestHandler,
-    LatestGameIntentHandler,
-    HistoricalGameIntentHandler,
-    HistoricalDateIntentHandler,
     DifficultyIntentHandler,
 
     AnswerIntentHandler,
