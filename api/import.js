@@ -379,8 +379,19 @@ export default async function handler(req, res) {
       });
     }
 
-    const date =
-      req.query.date || getYesterdayEastern();
+    let date;
+
+    if (req.query.date) {
+    // Manual testing still imports the exact requested date.
+    date = req.query.date;
+    } else {
+    const yesterday = getYesterdayEastern();
+
+    date = await findLatestAvailableDate(
+        yesterday,
+        7
+    );
+    }
 
     const result = await importDate(date);
 
@@ -396,4 +407,45 @@ export default async function handler(req, res) {
       error: error.message
     });
   }
+}
+
+async function findLatestAvailableDate(startDate, maxDaysBack = 7) {
+  const [year, month, day] = startDate.split('-').map(Number);
+  const start = new Date(Date.UTC(year, month - 1, day));
+
+  for (let offset = 0; offset <= maxDaysBack; offset++) {
+    const candidate = new Date(start);
+    candidate.setUTCDate(start.getUTCDate() - offset);
+
+    const date = candidate.toISOString().slice(0, 10);
+    const url = `${BASE}/game/${gameSlug(date)}`;
+
+    try {
+      const response = await axios.get(url, {
+        timeout: 15000,
+        validateStatus: () => true,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 DailyQuizAlexa/0.1'
+        }
+      });
+
+      if (response.status === 200) {
+        const text = String(response.data);
+
+        // Basic sanity check that this is actually a game page.
+        if (
+          /Jeopardy/i.test(text) &&
+          /Double Jeopardy/i.test(text)
+        ) {
+          return date;
+        }
+      }
+    } catch (error) {
+      console.log(`No usable game found for ${date}`);
+    }
+  }
+
+  throw new Error(
+    `No available Jeopardy game found within ${maxDaysBack} days of ${startDate}`
+  );
 }
