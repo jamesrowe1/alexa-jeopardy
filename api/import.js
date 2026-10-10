@@ -336,12 +336,13 @@ if (categories.length !== 12) {
     if (error) throw error;
   } else {
     const { data, error } = await supabase
-      .from('episodes')
-      .insert({
-        air_date: date
-      })
-      .select()
-      .single();
+        .from('episodes')
+        .insert({
+            air_date: date,
+            source_url: url
+        })
+        .select()
+        .single();
 
     if (error) throw error;
 
