@@ -587,12 +587,17 @@ const GiveUpIntentHandler = {
   }
 };
 
-const RepeatIntentHandler = {
+const RepeatClueIntentHandler = {
   canHandle(h) {
+    if (Alexa.getRequestType(h.requestEnvelope) !== 'IntentRequest') {
+      return false;
+    }
+
+    const intent = Alexa.getIntentName(h.requestEnvelope);
+
     return (
-      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
-      Alexa.getIntentName(h.requestEnvelope) ===
-        'AMAZON.RepeatIntent'
+      intent === 'AMAZON.RepeatIntent' ||
+      intent === 'RepeatClueIntent'
     );
   },
 
@@ -609,6 +614,164 @@ const RepeatIntentHandler = {
 
     return h.responseBuilder
       .speak(clueSpeech(clue))
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const RepeatCategoryIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'RepeatCategoryIntent'
+    );
+  },
+
+  handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+
+    if (!attrs.currentCategory) {
+      return h.responseBuilder
+        .speak('There is no active category right now.')
+        .getResponse();
+    }
+
+    return h.responseBuilder
+      .speak(
+        `The category is ${escapeSsml(attrs.currentCategory)}.`
+      )
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const ScoreIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'ScoreIntent'
+    );
+  },
+
+  handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+    const score = Number(attrs.score || 0);
+
+    return h.responseBuilder
+      .speak(`Your score is ${formatMoney(score)}.`)
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const ProgressIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'ProgressIntent'
+    );
+  },
+
+  handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+
+    if (!attrs.game) {
+      return h.responseBuilder
+        .speak('There is no active game.')
+        .getResponse();
+    }
+
+    const current = Number(attrs.gameIndex || 0) + 1;
+    const total = attrs.game.length;
+    const remaining = total - current;
+
+    let speech =
+      `You are on clue ${current} of ${total}.`;
+
+    if (remaining === 0) {
+      speech += ' This is the last clue.';
+    } else if (remaining === 1) {
+      speech += ' There is one clue after this one.';
+    } else {
+      speech += ` There are ${remaining} clues after this one.`;
+    }
+
+    return h.responseBuilder
+      .speak(speech)
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const RulesIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'RulesIntent'
+    );
+  },
+
+  handle(h) {
+    return h.responseBuilder
+      .speak(
+        `You will hear one clue from each of twelve categories, followed by Final Jeopardy. ` +
+        `Correct answers add the clue's value to your score. ` +
+        `Wrong answers and skipped clues do not subtract points. ` +
+        `You can say repeat clue, repeat category, what's my score, or I don't know at any time.`
+      )
+      .reprompt('What is your response?')
+      .getResponse();
+  }
+};
+
+const RestartGameIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'RestartGameIntent'
+    );
+  },
+
+  async handle(h) {
+    const attrs = h.attributesManager.getSessionAttributes();
+
+    if (!attrs.selectedEpisodeId || !attrs.difficulty) {
+      h.attributesManager.setSessionAttributes({
+        awaitingGameChoice: true
+      });
+
+      return h.responseBuilder
+        .speak(
+          `Let's start over. Would you like the latest game or a historical game?`
+        )
+        .reprompt(
+          'Say latest game or historical game.'
+        )
+        .getResponse();
+    }
+
+    const clues = await cluesForEpisode(
+      attrs.selectedEpisodeId
+    );
+
+    const game = buildGame(
+      clues,
+      attrs.difficulty
+    );
+
+    attrs.score = 0;
+    attrs.game = game;
+    attrs.gameIndex = 0;
+
+    const first = setCurrentClue(attrs);
+
+    h.attributesManager.setSessionAttributes(attrs);
+
+    return h.responseBuilder
+      .speak(
+        `Starting over. Your score is back to zero. ` +
+        `${clueSpeech(first)}`
+      )
       .reprompt('What is your response?')
       .getResponse();
   }
@@ -743,10 +906,21 @@ const skill = Alexa.SkillBuilders.custom()
   )
   .addRequestHandlers(
     LaunchRequestHandler,
+    LatestGameIntentHandler,
+    HistoricalGameIntentHandler,
+    HistoricalDateIntentHandler,
     DifficultyIntentHandler,
+
     AnswerIntentHandler,
     GiveUpIntentHandler,
-    RepeatIntentHandler,
+
+    RepeatClueIntentHandler,
+    RepeatCategoryIntentHandler,
+    ScoreIntentHandler,
+    ProgressIntentHandler,
+    RulesIntentHandler,
+    RestartGameIntentHandler,
+
     HelpIntentHandler,
     FallbackIntentHandler,
     CancelAndStopIntentHandler,
