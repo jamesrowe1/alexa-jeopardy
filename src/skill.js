@@ -41,11 +41,7 @@ async function cluesForEpisode(episodeId) {
   return data;
 }
 
-function randomItem(items) {
-  return items[Math.floor(Math.random() * items.length)];
-}
-
-function chooseOnePerCategory(clues, round) {
+function chooseDifficultyPerCategory(clues, round, difficulty) {
   const roundClues = clues.filter(c => c.round === round);
   const byCategory = new Map();
 
@@ -53,16 +49,34 @@ function chooseOnePerCategory(clues, round) {
     if (!byCategory.has(clue.category)) {
       byCategory.set(clue.category, []);
     }
+
     byCategory.get(clue.category).push(clue);
   }
 
-  return [...byCategory.values()].map(randomItem);
+  return [...byCategory.values()].map(categoryClues => {
+    const selected = categoryClues.find(
+      clue => Number(clue.board_position) === Number(difficulty)
+    );
+
+    if (!selected) {
+      throw new Error(
+        `Could not find difficulty ${difficulty} clue for category ${categoryClues[0]?.category}`
+      );
+    }
+
+    return selected;
+  });
 }
 
-function buildGame(clues) {
-  const jeopardy = chooseOnePerCategory(clues, 'J');
-  const doubleJeopardy = chooseOnePerCategory(clues, 'DJ');
-  const finalJeopardy = clues.find(c => c.round === 'FJ');
+function buildGame(clues, difficulty) {
+  const jeopardy =
+    chooseDifficultyPerCategory(clues, 'J', difficulty);
+
+  const doubleJeopardy =
+    chooseDifficultyPerCategory(clues, 'DJ', difficulty);
+
+  const finalJeopardy =
+    clues.find(c => c.round === 'FJ');
 
   if (
     jeopardy.length !== 6 ||
@@ -74,13 +88,18 @@ function buildGame(clues) {
     );
   }
 
-  return [...jeopardy, ...doubleJeopardy, finalJeopardy].map(
-    (clue, index) => ({
-      ...clue,
-      gameNumber: index + 1,
-      gameValue: clue.round === 'FJ' ? 2000 : Number(clue.value || 0)
-    })
-  );
+  return [
+    ...jeopardy,
+    ...doubleJeopardy,
+    finalJeopardy
+  ].map((clue, index) => ({
+    ...clue,
+    gameNumber: index + 1,
+    gameValue:
+      clue.round === 'FJ'
+        ? 2000
+        : Number(clue.value || 0)
+  }));
 }
 
 function formatDate(dateString) {
@@ -206,17 +225,70 @@ const LaunchRequestHandler = {
     return Alexa.getRequestType(h.requestEnvelope) === 'LaunchRequest';
   },
 
+  handle(h) {
+    h.attributesManager.setSessionAttributes({
+      awaitingDifficulty: true
+    });
+
+    return h.responseBuilder
+      .speak(
+        `Welcome to Daily Quiz. ` +
+        `Choose a difficulty from 1 to 5. `
+      )
+      .reprompt(
+        'Choose a difficulty from 1 to 5.'
+      )
+      .getResponse();
+  }
+};
+
+const DifficultyIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) === 'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) === 'DifficultyIntent'
+    );
+  },
+
   async handle(h) {
+    const difficulty = Number(
+      Alexa.getSlotValue(
+        h.requestEnvelope,
+        'difficulty'
+      )
+    );
+
+    if (
+      !Number.isInteger(difficulty) ||
+      difficulty < 1 ||
+      difficulty > 5
+    ) {
+      return h.responseBuilder
+        .speak(
+          'Please choose a difficulty from 1 to 5.'
+        )
+        .reprompt(
+          'What difficulty would you like? Choose 1 through 5.'
+        )
+        .getResponse();
+    }
+
     const episode = await latestEpisode();
     const clues = await cluesForEpisode(episode.id);
-    const game = buildGame(clues);
+
+    const game = buildGame(
+      clues,
+      difficulty
+    );
 
     const attrs = {
       episodeId: episode.id,
       airDate: episode.air_date,
+      difficulty,
       score: 0,
       game,
-      gameIndex: 0
+      gameIndex: 0,
+      awaitingDifficulty: false
     };
 
     const first = setCurrentClue(attrs);
@@ -225,13 +297,16 @@ const LaunchRequestHandler = {
 
     return h.responseBuilder
       .speak(
-        `Welcome to Daily Quiz. ` +
+        `Difficulty ${difficulty}. ` +
         `I'm using the game from ${formatDate(episode.air_date)}. ` +
-        `You'll get one randomly selected clue from each of the twelve categories, followed by Final Jeopardy. ` +
-        `There are thirteen clues total. Let's begin. ` +
+        `You'll get one clue from each of the twelve categories, ` +
+        `followed by Final Jeopardy. ` +
+        `Let's begin. ` +
         `${clueSpeech(first)}`
       )
-      .reprompt('What is your response?')
+      .reprompt(
+        'What is your response?'
+      )
       .getResponse();
   }
 };
@@ -505,6 +580,7 @@ const skill = Alexa.SkillBuilders.custom()
   )
   .addRequestHandlers(
     LaunchRequestHandler,
+    DifficultyIntentHandler,
     AnswerIntentHandler,
     GiveUpIntentHandler,
     RepeatIntentHandler,
