@@ -160,24 +160,187 @@ function setCurrentClue(attrs) {
   return clue;
 }
 
-function fuzzy(a, b) {
-  const norm = s =>
-    String(s || '')
+function fuzzy(userAnswer, expectedAnswer) {
+  function normalize(text) {
+    return String(text || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // remove accents
       .toLowerCase()
-      .replace(/\([^)]*\)/g, ' ')
-      .replace(
-        /\b(what|who|where|when|is|are|was|were|the|a|an)\b/g,
-        ' '
-      )
-      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/['’]/g, '')           // apostrophes
+      .replace(/&/g, ' and ')
+      .replace(/\b(what|who|where|when|which)\b/g, ' ')
+      .replace(/\b(is|are|was|were)\b/g, ' ')
+      .replace(/\b(the|a|an)\b/g, ' ')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
       .trim();
+  }
 
-  const A = norm(a);
-  const B = norm(b);
+  function singularize(word) {
+    if (word.length > 4 && word.endsWith('ies')) {
+      return word.slice(0, -3) + 'y';
+    }
 
-  if (!A || !B) return false;
+    if (
+      word.length > 4 &&
+      word.endsWith('s') &&
+      !word.endsWith('ss')
+    ) {
+      return word.slice(0, -1);
+    }
 
-  return A === B || A.includes(B) || B.includes(A);
+    return word;
+  }
+
+  function normalizeWords(text) {
+    return normalize(text)
+      .split(' ')
+      .filter(Boolean)
+      .map(singularize);
+  }
+
+  function levenshtein(a, b) {
+    const matrix = Array.from(
+      { length: b.length + 1 },
+      () => Array(a.length + 1).fill(0)
+    );
+
+    for (let i = 0; i <= b.length; i++) {
+      matrix[i][0] = i;
+    }
+
+    for (let j = 0; j <= a.length; j++) {
+      matrix[0][j] = j;
+    }
+
+    for (let i = 1; i <= b.length; i++) {
+      for (let j = 1; j <= a.length; j++) {
+        const cost =
+          b[i - 1] === a[j - 1] ? 0 : 1;
+
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j - 1] + cost
+        );
+      }
+    }
+
+    return matrix[b.length][a.length];
+  }
+
+  const user = normalize(userAnswer);
+  const expected = normalize(expectedAnswer);
+
+  if (!user || !expected) {
+    return false;
+  }
+
+  // Exact normalized match.
+  if (user === expected) {
+    return true;
+  }
+
+  const userWords = normalizeWords(userAnswer);
+  const expectedWords = normalizeWords(expectedAnswer);
+
+  const userJoined = userWords.join(' ');
+  const expectedJoined = expectedWords.join(' ');
+
+  if (userJoined === expectedJoined) {
+    return true;
+  }
+
+  // Allow a small speech-recognition / spelling error.
+  const distance = levenshtein(
+    userJoined,
+    expectedJoined
+  );
+
+  const longest = Math.max(
+    userJoined.length,
+    expectedJoined.length
+  );
+
+  if (
+    longest >= 6 &&
+    distance / longest <= 0.16
+  ) {
+    return true;
+  }
+
+  /*
+   * Allow surname-only responses for obvious person names.
+   *
+   * Benedict Arnold -> Arnold
+   * Thomas Jefferson -> Jefferson
+   * Abraham Lincoln -> Lincoln
+   *
+   * But don't do this for ordinary phrases like
+   * "breech birth" -> "birth".
+   */
+  if (userWords.length === 1) {
+    const originalExpected = String(expectedAnswer)
+      .replace(/[()[\],]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const capitalizedWords = originalExpected.filter(
+      word => /^[A-Z][A-Za-z'’.-]+$/.test(word)
+    );
+
+    const userWord = userWords[0];
+
+    if (
+      capitalizedWords.length >= 2 &&
+      userWord.length >= 4 &&
+      expectedWords.includes(userWord)
+    ) {
+      return true;
+    }
+  }
+
+  /*
+   * Accept answers that omit a generic trailing descriptor
+   * when the distinctive part is still present.
+   *
+   * "Hadrian Wall" -> "Hadrian's Wall"
+   * "Medici" -> "de' Medici"
+   */
+  const ignoredWords = new Set([
+    'de',
+    'da',
+    'del',
+    'di',
+    'du',
+    'la',
+    'le',
+    'van',
+    'von',
+    'of'
+  ]);
+
+  const importantExpected = expectedWords.filter(
+    word => !ignoredWords.has(word)
+  );
+
+  const importantUser = userWords.filter(
+    word => !ignoredWords.has(word)
+  );
+
+  if (
+    importantUser.length > 0 &&
+    importantUser.every(word =>
+      importantExpected.includes(word)
+    ) &&
+    importantUser.join('').length >= 5 &&
+    importantUser.length >=
+      Math.max(1, importantExpected.length - 1)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function advanceAfterAnswer(attrs, wasCorrect, expected) {
