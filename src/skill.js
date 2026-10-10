@@ -66,7 +66,11 @@ function addClueVisual(handlerInput, clue, attrs) {
       type: 'APL',
       version: '2024.3',
       theme: 'dark',
-
+      
+      settings: {
+        idleTimeout: 300000
+      },
+      
       mainTemplate: {
         items: [
           {
