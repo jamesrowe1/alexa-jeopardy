@@ -149,6 +149,65 @@ function getAlexaUserId(h) {
   );
 }
 
+function hasUnfinishedGame(state) {
+  return (
+    state &&
+    Array.isArray(state.game) &&
+    Number.isInteger(state.gameIndex) &&
+    state.gameIndex >= 0 &&
+    state.gameIndex < state.game.length &&
+    state.currentClueId != null
+  );
+}
+
+async function loadInProgressGame(h) {
+  const userId = getAlexaUserId(h);
+  if (!userId) return null;
+
+  const { data, error } = await supabase
+    .from('alexa_in_progress_games')
+    .select('state')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return data?.state || null;
+}
+
+async function saveInProgressGame(h, state) {
+  const userId = getAlexaUserId(h);
+
+  if (!userId) {
+    throw new Error('Cannot save game without Alexa user ID');
+  }
+
+  const { error } = await supabase
+    .from('alexa_in_progress_games')
+    .upsert(
+      {
+        user_id: userId,
+        state,
+        updated_at: new Date().toISOString()
+      },
+      { onConflict: 'user_id' }
+    );
+
+  if (error) throw error;
+}
+
+async function clearInProgressGame(h) {
+  const userId = getAlexaUserId(h);
+  if (!userId) return;
+
+  const { error } = await supabase
+    .from('alexa_in_progress_games')
+    .delete()
+    .eq('user_id', userId);
+
+  if (error) throw error;
+}
+
 async function mostRecentUnplayedEpisode(h) {
   const userId = getAlexaUserId(h);
 
@@ -573,20 +632,45 @@ function advanceAfterAnswer(
 
 const LaunchRequestHandler = {
   canHandle(h) {
-    return Alexa.getRequestType(h.requestEnvelope) ===
-      'LaunchRequest';
+    return (
+      Alexa.getRequestType(h.requestEnvelope) ===
+      'LaunchRequest'
+    );
   },
 
   handle(h) {
+    const attrs =
+      h.attributesManager.getSessionAttributes();
+
+    // Resume an unfinished game.
+    if (hasUnfinishedGame(attrs)) {
+      const clue = attrs.game[attrs.gameIndex];
+
+      // Restore the Echo Show display.
+      addClueVisual(h, clue, attrs);
+
+      return h.responseBuilder
+        .speak(
+          `Welcome back to Daily Quiz. ` +
+          `You're on clue ${attrs.gameIndex + 1} ` +
+          `of ${attrs.game.length}. ` +
+          `Your score is ${formatMoney(attrs.score)}. ` +
+          `${clueSpeech(clue)}`
+        )
+        .reprompt('What is your response?')
+        .getResponse();
+    }
+
+    // No unfinished game: normal selection menu.
     h.attributesManager.setSessionAttributes({
       awaitingGameChoice: true
     });
 
     return h.responseBuilder
       .speak(
-        'Welcome to Daily Quiz. ' +
-        'Would you like the latest game, ' +
-        'or the most recent unplayed game?'
+        `Welcome to Daily Quiz. ` +
+        `Would you like the latest game, ` +
+        `or the most recent unplayed game?`
       )
       .reprompt(
         'Say latest game or unplayed game.'
@@ -1186,6 +1270,107 @@ const ErrorHandler = {
   }
 };
 
+const NewGameIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) ===
+        'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) ===
+        'NewGameIntent'
+    );
+  },
+
+  handle(h) {
+    h.attributesManager.setSessionAttributes({
+      awaitingGameChoice: true
+    });
+
+    return h.responseBuilder
+      .speak(
+        `Starting a new game. ` +
+        `Would you like the latest game, ` +
+        `or the most recent unplayed game?`
+      )
+      .reprompt(
+        'Say latest game or unplayed game.'
+      )
+      .getResponse();
+  }
+};
+
+const LoadInProgressInterceptor = {
+  async process(h) {
+    const requestType =
+      Alexa.getRequestType(h.requestEnvelope);
+
+    if (requestType === 'SessionEndedRequest') {
+      return;
+    }
+
+    const attrs =
+      h.attributesManager.getSessionAttributes();
+
+    // Current-session state takes precedence.
+    if (Object.keys(attrs || {}).length > 0) {
+      return;
+    }
+
+    // New session: restore the saved game if one exists.
+    const saved = await loadInProgressGame(h);
+
+    if (hasUnfinishedGame(saved)) {
+      h.attributesManager.setSessionAttributes(saved);
+    }
+  }
+};
+
+const SaveInProgressInterceptor = {
+  async process(h) {
+    const requestType =
+      Alexa.getRequestType(h.requestEnvelope);
+
+    if (requestType === 'SessionEndedRequest') {
+      return;
+    }
+
+    const attrs =
+      h.attributesManager.getSessionAttributes();
+
+    const intentName =
+      requestType === 'IntentRequest'
+        ? Alexa.getIntentName(h.requestEnvelope)
+        : null;
+
+    // Choosing another game discards the old progress.
+    if (
+      [
+        'NewGameIntent',
+        'LatestGameIntent',
+        'UnplayedGameIntent'
+      ].includes(intentName) &&
+      !hasUnfinishedGame(attrs)
+    ) {
+      await clearInProgressGame(h);
+      return;
+    }
+
+    // Save the current clue, score, difficulty, etc.
+    if (hasUnfinishedGame(attrs)) {
+      await saveInProgressGame(h, attrs);
+      return;
+    }
+
+    // Completed all thirteen clues: remove saved progress.
+    if (
+      Array.isArray(attrs?.game) &&
+      attrs.game.length > 0 &&
+      attrs.gameIndex >= attrs.game.length
+    ) {
+      await clearInProgressGame(h);
+    }
+  }
+};
+
 const SkillIdValidationInterceptor = {
   process(handlerInput) {
     const expectedSkillId =
@@ -1211,12 +1396,17 @@ const SkillIdValidationInterceptor = {
 
 const skill = Alexa.SkillBuilders.custom()
   .addRequestInterceptors(
-    SkillIdValidationInterceptor
+  SkillIdValidationInterceptor,
+  LoadInProgressInterceptor
+  )
+  .addResponseInterceptors(
+    SaveInProgressInterceptor
   )
   .addRequestHandlers(
     LaunchRequestHandler,
     LatestGameIntentHandler,
     UnplayedGameIntentHandler,
+    NewGameIntentHandler,
     DifficultyIntentHandler,
 
     AnswerIntentHandler,
