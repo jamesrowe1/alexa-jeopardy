@@ -3,4 +3,3 @@ node_modules/
 .env.local
 .vercel
 
-//cron secret 821cdfbf46107a4a4bb7affc41cf7596e728e8c5b3fa38c51851f3d112dabe79
