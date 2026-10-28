@@ -142,6 +142,69 @@ async function latestEpisode() {
   return data;
 }
 
+function getAlexaUserId(h) {
+  return (
+    h.requestEnvelope.context?.System?.user?.userId ||
+    h.requestEnvelope.session?.user?.userId
+  );
+}
+
+async function mostRecentUnplayedEpisode(h) {
+  const userId = getAlexaUserId(h);
+
+  if (!userId) {
+    throw new Error('Alexa user ID unavailable');
+  }
+
+  const { data: episodes, error: episodeError } =
+    await supabase
+      .from('episodes')
+      .select('id, air_date')
+      .order('air_date', { ascending: false })
+      .limit(500);
+
+  if (episodeError) throw episodeError;
+
+  const { data: completed, error: completedError } =
+    await supabase
+      .from('alexa_completed_games')
+      .select('episode_id')
+      .eq('user_id', userId);
+
+  if (completedError) throw completedError;
+
+  const completedIds = new Set(
+    completed.map(row => String(row.episode_id))
+  );
+
+  return episodes.find(
+    episode => !completedIds.has(String(episode.id))
+  ) || null;
+}
+
+async function markEpisodePlayed(h, episodeId) {
+  const userId = getAlexaUserId(h);
+
+  if (!userId || !episodeId) {
+    throw new Error('Missing user or episode ID');
+  }
+
+  const { error } = await supabase
+    .from('alexa_completed_games')
+    .upsert(
+      {
+        user_id: userId,
+        episode_id: episodeId,
+        completed_at: new Date().toISOString()
+      },
+      {
+        onConflict: 'user_id,episode_id'
+      }
+    );
+
+  if (error) throw error;
+}
+
 async function cluesForEpisode(episodeId) {
   const { data, error } = await supabase
     .from('clues')
@@ -510,22 +573,95 @@ function advanceAfterAnswer(
 
 const LaunchRequestHandler = {
   canHandle(h) {
-    return Alexa.getRequestType(h.requestEnvelope) === 'LaunchRequest';
+    return Alexa.getRequestType(h.requestEnvelope) ===
+      'LaunchRequest';
   },
 
   handle(h) {
     h.attributesManager.setSessionAttributes({
+      awaitingGameChoice: true
+    });
+
+    return h.responseBuilder
+      .speak(
+        'Welcome to Daily Quiz. ' +
+        'Would you like the latest game, ' +
+        'or the most recent unplayed game?'
+      )
+      .reprompt(
+        'Say latest game or unplayed game.'
+      )
+      .getResponse();
+  }
+};
+
+const LatestGameIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) ===
+        'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) ===
+        'LatestGameIntent'
+    );
+  },
+
+  async handle(h) {
+    const episode = await latestEpisode();
+
+    h.attributesManager.setSessionAttributes({
+      selectedEpisodeId: episode.id,
+      airDate: episode.air_date,
       awaitingDifficulty: true
     });
 
     return h.responseBuilder
       .speak(
-        `Welcome to Daily Quiz. ` +
-        `Choose a difficulty from 1 to 5. `
+        `The latest game is from ` +
+        `${formatDate(episode.air_date)}. ` +
+        `Choose a difficulty from 1 to 5.`
       )
-      .reprompt(
-        'Choose a difficulty from 1 to 5.'
+      .reprompt('Choose a difficulty from 1 to 5.')
+      .getResponse();
+  }
+};
+
+const UnplayedGameIntentHandler = {
+  canHandle(h) {
+    return (
+      Alexa.getRequestType(h.requestEnvelope) ===
+        'IntentRequest' &&
+      Alexa.getIntentName(h.requestEnvelope) ===
+        'UnplayedGameIntent'
+    );
+  },
+
+  async handle(h) {
+    const episode = await mostRecentUnplayedEpisode(h);
+
+    if (!episode) {
+      return h.responseBuilder
+        .speak(
+          'You have completed every game currently ' +
+          'available in your database. ' +
+          'You can play the latest game again.'
+        )
+        .reprompt('Say latest game to play again.')
+        .getResponse();
+    }
+
+    h.attributesManager.setSessionAttributes({
+      selectedEpisodeId: episode.id,
+      airDate: episode.air_date,
+      awaitingDifficulty: true
+    });
+
+    return h.responseBuilder
+      .speak(
+        `Your most recent unplayed game is from ` +
+        `${formatDate(episode.air_date)}. ` +
+        `Choose a difficulty from 1 to 5.`
       )
+      .reprompt('What difficulty would you like?')
       .getResponse();
   }
 };
@@ -561,7 +697,24 @@ const DifficultyIntentHandler = {
         .getResponse();
     }
 
-    const episode = await latestEpisode();
+    const selectedAttrs =
+      h.attributesManager.getSessionAttributes();
+
+    let episode;
+
+    if (selectedAttrs.selectedEpisodeId) {
+      const { data, error } = await supabase
+        .from('episodes')
+        .select('*')
+        .eq('id', selectedAttrs.selectedEpisodeId)
+        .single();
+
+      if (error) throw error;
+
+      episode = data;
+    } else {
+      episode = await latestEpisode();
+    }
     const clues = await cluesForEpisode(episode.id);
 
     const game = buildGame(
@@ -609,7 +762,7 @@ const AnswerIntentHandler = {
     );
   },
 
-  handle(h) {
+  async handle(h) {
     const attrs = h.attributesManager.getSessionAttributes();
 
     if (!attrs.currentClueId || !attrs.game) {
@@ -640,6 +793,12 @@ const AnswerIntentHandler = {
     h.attributesManager.setSessionAttributes(attrs);
 
     if (result.done) {
+      try {
+        await markEpisodePlayed(h, attrs.episodeId);
+      } catch (error) {
+        console.error('Could not save completed game:', error);
+      }
+
       return h.responseBuilder
         .speak(result.speech)
         .getResponse();
@@ -660,7 +819,7 @@ const GiveUpIntentHandler = {
     );
   },
 
-  handle(h) {
+  async handle(h) {
     const attrs = h.attributesManager.getSessionAttributes();
 
     if (!attrs.currentClueId || !attrs.game) {
@@ -683,7 +842,11 @@ const GiveUpIntentHandler = {
 
     if (attrs.gameIndex >= attrs.game.length) {
       h.attributesManager.setSessionAttributes(attrs);
-
+      try {
+        await markEpisodePlayed(h, attrs.episodeId);
+      } catch (error) {
+        console.error('Could not save completed game:', error);
+      }
       return h.responseBuilder
         .speak(
           `${resultText} ` +
@@ -1052,6 +1215,8 @@ const skill = Alexa.SkillBuilders.custom()
   )
   .addRequestHandlers(
     LaunchRequestHandler,
+    LatestGameIntentHandler,
+    UnplayedGameIntentHandler,
     DifficultyIntentHandler,
 
     AnswerIntentHandler,
